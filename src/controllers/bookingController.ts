@@ -89,7 +89,7 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     // Ambil data konsol
     const consolResult = await pool.query(
-      'SELECT id, nama, harga_per_jam, status FROM consoles WHERE id = $1',
+      'SELECT id, nama, harga_per_jam, status, stok FROM consoles WHERE id = $1',
       [consolId]
     )
     if (consolResult.rows.length === 0) {
@@ -104,12 +104,50 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     const totalBiaya = consol.harga_per_jam * parseInt(durasi)
 
-    // ── Cek overlap waktu booking ─────────────────────────────────────────
-    // Hitung waktu selesai booking baru
+    // ── Jam operasional ────────────────────────────────────────────────────
+    const JAM_BUKA = 8
+    const JAM_TUTUP = 22
+
+    // Hitung waktu mulai & selesai booking baru (dalam menit)
     const [reqH, reqM] = (waktuMulai as string).split(':').map(Number)
     const reqMulai  = reqH * 60 + reqM
     const reqSelesai = reqMulai + parseInt(durasi) * 60
 
+    // Validasi: tidak boleh mulai sebelum jam buka
+    if (reqMulai < JAM_BUKA * 60) {
+      res.status(400).json({
+        success: false,
+        message: `Waktu booking tidak boleh sebelum jam buka (${JAM_BUKA.toString().padStart(2, '0')}:00).`
+      })
+      return
+    }
+
+    // Validasi: tidak boleh melewati jam tutup
+    if (reqSelesai > JAM_TUTUP * 60) {
+      res.status(400).json({
+        success: false,
+        message: `Durasi yang dipilih membuat sesi berakhir melewati jam tutup (${JAM_TUTUP.toString().padStart(2, '0')}:00). Silakan kurangi durasi atau pilih waktu mulai lebih awal.`
+      })
+      return
+    }
+
+    // Validasi: tidak boleh booking untuk tanggal/waktu yang sudah lewat
+    const now = new Date()
+    const todayStr = now.toISOString().split('T')[0]
+    if (tanggalBooking < todayStr) {
+      res.status(400).json({ success: false, message: 'Tidak dapat membuat booking untuk tanggal yang sudah lewat.' })
+      return
+    }
+    if (tanggalBooking === todayStr) {
+      const nowMinutes = now.getHours() * 60 + now.getMinutes()
+      if (reqMulai < nowMinutes) {
+        res.status(400).json({ success: false, message: 'Waktu yang dipilih sudah lewat. Silakan pilih jam yang masih akan datang.' })
+        return
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
+    // ── Cek overlap waktu booking ─────────────────────────────────────────
     const overlapCheck = await pool.query(
       `SELECT COUNT(*) AS cnt
        FROM bookings
@@ -402,7 +440,14 @@ export const getAvailability = async (req: Request, res: Response): Promise<void
       tersedia: boolean
       sisaUnit: number
       totalUnit: number
+      lewatWaktu: boolean
     }[] = []
+
+    // Tentukan apakah tanggal yang diminta adalah hari ini, untuk mengecek slot yang sudah lewat
+    const now = new Date()
+    const todayStr = now.toISOString().split('T')[0]
+    const isToday = tanggal === todayStr
+    const nowMinutes = now.getHours() * 60 + now.getMinutes()
 
     for (let h = JAM_BUKA; h < JAM_TUTUP; h++) {
       const jam = h.toString().padStart(2, '0') + ':00'
@@ -415,11 +460,16 @@ export const getAvailability = async (req: Request, res: Response): Promise<void
         if (h >= mulai && h < selesai) terpakai++
       }
       const sisa = stok - terpakai
+
+      // Slot jam ini sudah lewat dari waktu sekarang (hanya relevan jika tanggal = hari ini)
+      const lewatWaktu = isToday && (h * 60) < nowMinutes
+
       slots.push({
         jam,
-        tersedia: sisa > 0,
+        tersedia: sisa > 0 && !lewatWaktu,
         sisaUnit: Math.max(0, sisa),
         totalUnit: stok,
+        lewatWaktu,
       })
     }
 
@@ -445,6 +495,8 @@ export const getAvailability = async (req: Request, res: Response): Promise<void
         bookedSlots,
         jamBuka: `${JAM_BUKA.toString().padStart(2, '0')}:00`,
         jamTutup: `${JAM_TUTUP.toString().padStart(2, '0')}:00`,
+        serverTime: now.toISOString(),
+        isToday,
       }
     })
   } catch (err) {
