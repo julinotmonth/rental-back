@@ -3,7 +3,7 @@ import { body } from 'express-validator'
 import {
   getBookings, getBookingById, createBooking,
   updateBookingStatus, uploadBukti,
-  getLaporanSummary, getDashboardStats
+  getLaporanSummary, getDashboardStats, getAvailability
 } from '../controllers/bookingController'
 import { authenticate, authorizeAdmin } from '../middleware/auth'
 import { validate } from '../middleware/errorHandler'
@@ -13,6 +13,9 @@ const router = Router()
 // Stats (admin)
 router.get('/dashboard/stats', authenticate, authorizeAdmin, getDashboardStats)
 router.get('/laporan/summary', authenticate, authorizeAdmin, getLaporanSummary)
+
+// Availability (public - tidak perlu login untuk cek ketersediaan)
+router.get('/availability', getAvailability)
 
 // Bookings CRUD
 router.get('/', authenticate, getBookings)

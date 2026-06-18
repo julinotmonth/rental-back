@@ -104,6 +104,44 @@ export const createBooking = async (req: Request, res: Response): Promise<void> 
 
     const totalBiaya = consol.harga_per_jam * parseInt(durasi)
 
+    // ── Cek overlap waktu booking ─────────────────────────────────────────
+    // Hitung waktu selesai booking baru
+    const [reqH, reqM] = (waktuMulai as string).split(':').map(Number)
+    const reqMulai  = reqH * 60 + reqM
+    const reqSelesai = reqMulai + parseInt(durasi) * 60
+
+    const overlapCheck = await pool.query(
+      `SELECT COUNT(*) AS cnt
+       FROM bookings
+       WHERE console_id    = $1
+         AND tanggal_booking = $2
+         AND status         IN ('pending', 'dikonfirmasi')
+         AND (
+           -- Booking yang sudah ada overlap dengan waktu baru
+           (EXTRACT(HOUR FROM waktu_mulai) * 60 + EXTRACT(MINUTE FROM waktu_mulai))
+             < $4
+           AND
+           (EXTRACT(HOUR FROM waktu_mulai) * 60 + EXTRACT(MINUTE FROM waktu_mulai))
+             + durasi * 60 > $3
+         )`,
+      [consolId, tanggalBooking, reqMulai, reqSelesai]
+    )
+
+    const terpakai = parseInt(overlapCheck.rows[0].cnt)
+    if (terpakai >= consol.stok) {
+      const [selesaiH, selesaiM] = [
+        Math.floor(reqSelesai / 60).toString().padStart(2, '0'),
+        (reqSelesai % 60).toString().padStart(2, '0'),
+      ]
+      res.status(409).json({
+        success: false,
+        message: `Konsol tidak tersedia pada jam ${waktuMulai}–${selesaiH}:${selesaiM} tanggal ${tanggalBooking}. Semua unit (${consol.stok}) sudah dipesan. Silakan pilih waktu lain.`,
+        data: { konflik: true, stok: consol.stok, terpakai }
+      })
+      return
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     // Generate no booking unik
     let noBooking = generateNoBooking()
     let attempt = 0
@@ -324,5 +362,93 @@ export const getDashboardStats = async (req: Request, res: Response): Promise<vo
   } catch (err) {
     console.error(err)
     res.status(500).json({ success: false, message: 'Gagal mengambil statistik dashboard' })
+  }
+}
+
+// GET /api/bookings/availability?consolId=X&tanggal=YYYY-MM-DD
+// Mengembalikan slot-slot waktu yang sudah terpakai untuk konsol + tanggal tertentu
+export const getAvailability = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { consolId, tanggal } = req.query
+
+    if (!consolId || !tanggal) {
+      res.status(400).json({ success: false, message: 'consolId dan tanggal wajib diisi' })
+      return
+    }
+
+    // Ambil semua booking aktif untuk konsol + tanggal tersebut
+    const result = await pool.query(
+      `SELECT waktu_mulai, durasi, nama_user, status
+       FROM bookings
+       WHERE console_id = $1
+         AND tanggal_booking = $2
+         AND status IN ('pending', 'dikonfirmasi')
+       ORDER BY waktu_mulai ASC`,
+      [consolId, tanggal]
+    )
+
+    // Hitung stok konsol
+    const consolResult = await pool.query(
+      'SELECT stok FROM consoles WHERE id = $1',
+      [consolId]
+    )
+    const stok = consolResult.rows[0]?.stok || 1
+
+    // Buat daftar slot terpakai per jam (08:00–22:00)
+    const JAM_BUKA = 8
+    const JAM_TUTUP = 22
+    const slots: {
+      jam: string
+      tersedia: boolean
+      sisaUnit: number
+      totalUnit: number
+    }[] = []
+
+    for (let h = JAM_BUKA; h < JAM_TUTUP; h++) {
+      const jam = h.toString().padStart(2, '0') + ':00'
+      // Hitung berapa booking yang overlap jam ini
+      let terpakai = 0
+      for (const row of result.rows) {
+        const [bh, bm] = (row.waktu_mulai as string).split(':').map(Number)
+        const mulai = bh + bm / 60
+        const selesai = mulai + row.durasi
+        if (h >= mulai && h < selesai) terpakai++
+      }
+      const sisa = stok - terpakai
+      slots.push({
+        jam,
+        tersedia: sisa > 0,
+        sisaUnit: Math.max(0, sisa),
+        totalUnit: stok,
+      })
+    }
+
+    // Kirim juga daftar booking mentah untuk frontend
+    const bookedSlots = result.rows.map((r: any) => ({
+      waktuMulai: (r.waktu_mulai as string).slice(0, 5),
+      durasi: r.durasi,
+      waktuSelesai: (() => {
+        const [h, m] = (r.waktu_mulai as string).split(':').map(Number)
+        const selesaiH = h + r.durasi
+        return selesaiH.toString().padStart(2, '0') + ':' + m.toString().padStart(2, '0')
+      })(),
+      status: r.status,
+    }))
+
+    res.json({
+      success: true,
+      data: {
+        consolId,
+        tanggal,
+        stok,
+        slots,
+        bookedSlots,
+        jamBuka: `${JAM_BUKA.toString().padStart(2, '0')}:00`,
+        jamTutup: `${JAM_TUTUP.toString().padStart(2, '0')}:00`,
+      }
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ success: false, message: 'Gagal mengambil data availability' })
   }
 }
